@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>txaudit sandbox checkout</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 16px; color: #1d1d1f; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.05rem; margin-top: 1.8rem; }
+  .field { height: 40px; border: 1px solid #bbb; border-radius: 6px; padding: 0 10px; margin-bottom: 10px; }
+  .row { display: flex; gap: 10px; } .row > div { flex: 1; }
+  label { font-size: 13px; color: #555; }
+  button { padding: 9px 16px; border-radius: 6px; border: 1px solid #333; background: #fff; cursor: pointer; }
+  button.primary { background: #1d1d1f; color: #fff; }
+  button:disabled { opacity: .4; cursor: default; }
+  input, select { padding: 7px; border: 1px solid #bbb; border-radius: 6px; }
+  pre { background: #f4f4f5; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12.5px; }
+  .muted { color: #666; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Sandbox checkout</h1>
+<p class="muted">Step 1 tokenizes a payment method in the browser and vaults it on the server.
+Step 2 authorizes it, creates the order and runs the audit. Test cards: 4111 1111 1111 1111, any future date, CVV 123.
+Amounts 2000.00–2999.99 decline and 3000.00 fails in the sandbox.</p>
+
+<h2>1. Payment method</h2>
+<form id="card-form">
+  <label>Card number</label><div id="card-number" class="field"></div>
+  <div class="row">
+    <div><label>Expiry</label><div id="expiration-date" class="field"></div></div>
+    <div><label>CVV</label><div id="cvv" class="field"></div></div>
+  </div>
+  <button id="card-submit" class="primary" disabled>Vault card</button>
+</form>
+<p>or</p>
+<div id="paypal-button"></div>
+<button id="venmo-button" disabled>Pay with Venmo</button>
+<p id="token-status" class="muted">No payment method yet.</p>
+
+<h2>2. Place order</h2>
+<div class="row">
+  <div><label>Amount</label><br><input id="amount" value="49.99"></div>
+  <div><label>Recommender</label><br>
+    <select id="recommender"><option value="llm">Claude + guard</option><option value="rules">Rules + guard</option></select></div>
+  <div><label>Inject fault</label><br>
+    <select id="fault"><option value="">none</option>
+      <option value="timeout_before_commit">order timeout, no order</option>
+      <option value="timeout_after_commit">order timeout, response lost</option></select></div>
+</div>
+<p><button id="place-order" class="primary" disabled>Place order</button></p>
+<pre id="result">–</pre>
+
+<script src="https://js.braintreegateway.com/web/3.146.0/js/client.min.js"></script>
+<script src="https://js.braintreegateway.com/web/3.146.0/js/hosted-fields.min.js"></script>
+<script src="https://js.braintreegateway.com/web/3.146.0/js/paypal-checkout.min.js"></script>
+<script src="https://js.braintreegateway.com/web/3.146.0/js/venmo.min.js"></script>
+<script>
+let platformToken = null;
+const $ = (id) => document.getElementById(id);
+
+async function api(path, body) {
+  const res = await fetch(path, body ? {
+    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+  } : undefined);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || res.statusText);
+  return data;
+}
+
+// The nonce goes to our server once and is exchanged for a platform token.
+async function vaultNonce(nonce, label) {
+  $("token-status").textContent = "Vaulting " + label + "…";
+  try {
+    const out = await api("/api/vault", {nonce});
+    platformToken = out.platform_token;
+    $("token-status").textContent = "Vaulted " + out.instrument + ". Platform token issued.";
+    $("place-order").disabled = false;
+  } catch (e) {
+    $("token-status").textContent = "Vault failed: " + e.message;
+  }
+}
+
+async function init() {
+  const {client_token} = await api("/api/client-token");
+  const client = await braintree.client.create({authorization: client_token});
+
+  const hf = await braintree.hostedFields.create({
+    client,
+    fields: {
+      number: {container: "#card-number", placeholder: "4111 1111 1111 1111"},
+      expirationDate: {container: "#expiration-date", placeholder: "MM/YY"},
+      cvv: {container: "#cvv", placeholder: "123"},
+    },
+  });
+  $("card-submit").disabled = false;
+  $("card-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    try {
+      const payload = await hf.tokenize();
+      await vaultNonce(payload.nonce, "card");
+    } catch (e) { $("token-status").textContent = "Card error: " + e.message; }
+  });
+
+  // PayPal must use the vault flow, or the nonce cannot be stored as a payment method.
+  const ppc = await braintree.paypalCheckout.create({client});
+  await ppc.loadPayPalSDK({vault: true});
+  paypal.Buttons({
+    fundingSource: paypal.FUNDING.PAYPAL,
+    createBillingAgreement: () => ppc.createPayment({flow: "vault"}),
+    onApprove: async (data) => {
+      const payload = await ppc.tokenizePayment(data);
+      await vaultNonce(payload.nonce, "PayPal");
+    },
+    onError: (e) => { $("token-status").textContent = "PayPal error: " + e; },
+  }).render("#paypal-button");
+
+  // Venmo needs multi_use to be vaultable. Desktop support in the sandbox is limited.
+  try {
+    const venmo = await braintree.venmo.create({client, allowDesktop: true, paymentMethodUsage: "multi_use"});
+    if (venmo.isBrowserSupported()) {
+      $("venmo-button").disabled = false;
+      $("venmo-button").onclick = async () => {
+        try { const p = await venmo.tokenize(); await vaultNonce(p.nonce, "Venmo"); }
+        catch (e) { $("token-status").textContent = "Venmo error: " + e.message; }
+      };
+    }
+  } catch (e) { console.warn("Venmo unavailable:", e); }
+}
+
+$("place-order").onclick = async () => {
+  $("place-order").disabled = true;
+  $("result").textContent = "Authorizing and auditing…";
+  try {
+    const out = await api("/api/place-order", {
+      platform_token: platformToken, amount: $("amount").value,
+      recommender: $("recommender").value, fault: $("fault").value || null,
+    });
+    $("result").textContent = JSON.stringify(out, null, 2);
+  } catch (e) {
+    $("result").textContent = "Error: " + e.message;
+  } finally { $("place-order").disabled = false; }
+};
+
+init().catch((e) => { $("token-status").textContent = "Setup failed: " + e.message; });
+</script>
+</body>
+</html>
