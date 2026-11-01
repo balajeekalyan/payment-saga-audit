@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+title: "txaudit: privacy-preserving LLM auditor for Braintree checkout sagas"
+abstract: >-
+  Claude audits each checkout saga and recommends approve / void / refund /
+  no_action / escalate. A deterministic policy guard checks every
+  recommendation against fresh gateway state and executes or escalates. The
+  model only sees an allow-listed, pseudonymized view with no PII or PCI data.
+type: software
+version: 0.1.0
+authors:
+  - family-names: Kalyanasundaram
+    given-names: Balajee
+    affiliation: Independent Researcher
+    email: balajeekalyanasundaram@ieee.org
+    orcid: "https://orcid.org/0009-0007-7292-2417"
+repository-code: "https://github.com/balajeekalyan/payment-saga-audit"
+license: MIT
+keywords:
+  - llm
+  - payments
+  - braintree
+  - saga
+  - privacy
+  - auditing
+date-released: "2026-10-31"
